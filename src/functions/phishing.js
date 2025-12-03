@@ -21,6 +21,7 @@ const delete_headers = [
   "content-length",
   "content-encoding",
   "Set-Cookie",
+  "transfer-encoding",
 ];
 
 async function replace_response_text(response, upstream, original) {
