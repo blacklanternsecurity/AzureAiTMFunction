@@ -9,7 +9,7 @@ loot/
 compromised_users.txt
 feed.txt
 template_v2.html
-client_branding/
+*_branding/
 enum_archive.js
 enumerate.js
 phishing_orig.js
