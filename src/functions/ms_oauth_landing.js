@@ -90,7 +90,7 @@ app.http("direct_login", {
     const proxyLoginPath = "/common/oauth2/v2.0/authorize?" + new URLSearchParams({
       response_type: "code",
       client_id: "1fec8e78-bce4-4aaf-ab1b-5451cc387264",
-      scope: "openid profile",
+      scope: "openid profile offline_access https://graph.microsoft.com/.default",
       redirect_uri: "https://login.microsoftonline.com/common/oauth2/nativeclient",
       state: "x",
     }).toString();
