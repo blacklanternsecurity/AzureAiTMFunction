@@ -634,8 +634,8 @@ const ACTIONS = {
   recon: [
     {label:"Profile",         path:"/v1.0/me"},
     {label:"Organization",    path:"/v1.0/organization"},
-    {label:"Directory Roles", path:"/v1.0/me/memberOf"},
-    {label:"Devices",         path:"/v1.0/me/registeredDevices"},
+    {label:"Directory Roles", path:"/v1.0/me/memberOf",render:"roles"},
+    {label:"Devices",         path:"/v1.0/me/registeredDevices",render:"devices"},
     {label:"Auth Methods",    path:"/v1.0/me/authentication/methods"},
     {label:"Add MFA Phone",   action:"add-mfa-phone"},
     {label:"Add MFA Email",   action:"add-mfa-email"},
@@ -1811,6 +1811,32 @@ function showResult(path, data, renderer) {
       }
     }
     html += '</table>';
+  } else if (renderer==="roles" && items) {
+    var roles = items.filter(function(i){return (i["@odata.type"]||"").indexOf("directoryRole")!==-1;});
+    var groups = items.filter(function(i){return (i["@odata.type"]||"").indexOf("group")!==-1;});
+    if (roles.length) {
+      html += '<div style="margin:8px 10px 4px;font-size:16px;color:var(--text-dim)">Directory Roles ('+roles.length+')</div>';
+      html += '<table class="result-table"><tr><th>Role</th><th>Description</th></tr>';
+      for (const r of roles) { html += '<tr><td>'+esc(r.displayName||"?")+'</td><td style="color:var(--text-dim)">'+esc(r.description||"")+'</td></tr>'; }
+      html += '</table>';
+    }
+    if (groups.length) {
+      html += '<div style="margin:8px 10px 4px;font-size:16px;color:var(--text-dim)">Group Memberships ('+groups.length+')</div>';
+      html += '<table class="result-table"><tr><th>Group</th><th>Description</th></tr>';
+      for (const g of groups) { html += '<tr><td>'+esc(g.displayName||"?")+'</td><td style="color:var(--text-dim)">'+esc(g.description||"")+'</td></tr>'; }
+      html += '</table>';
+    }
+    if (!roles.length && !groups.length) {
+      html += '<div style="color:var(--text-dim);padding:20px;text-align:center">No directory roles or group memberships</div>';
+    }
+  } else if (renderer==="devices" && items) {
+    if (!items.length) {
+      html += '<div style="color:var(--text-dim);padding:20px;text-align:center">No registered devices</div>';
+    } else {
+      html += '<table class="result-table"><tr><th>Device</th><th>OS</th><th>Trust Type</th><th>Last Active</th></tr>';
+      for (const d of items) { html += '<tr><td>'+esc(d.displayName||"?")+'</td><td>'+esc((d.operatingSystem||"")+" "+(d.operatingSystemVersion||""))+'</td><td>'+esc(d.trustType||"")+'</td><td>'+esc((d.approximateLastSignInDateTime||"").split("T")[0])+'</td></tr>'; }
+      html += '</table>';
+    }
   } else {
     // Default: raw JSON
     html += '<div class="result-json" id="result-raw">'+esc(JSON.stringify(data,null,2))+'</div>';
