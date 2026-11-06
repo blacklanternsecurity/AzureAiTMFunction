@@ -849,6 +849,8 @@ function graphPreset(path) {
 
 async function sendGraphExplorer() {
   if (!selectedSession) return;
+  resultNavStack.length = 0;
+  document.getElementById("results-area").innerHTML = '<div style="color:var(--text-dim);padding:20px;text-align:center">Run an action to see results here</div>';
   const ep = document.getElementById("graph-endpoint").value;
   const method = document.getElementById("graph-method").value;
   const status = document.getElementById("explorer-status");
@@ -994,6 +996,9 @@ function renderActionCats() {
 }
 function setCat(c) {
   activeCat=c; renderActionCats(); renderActions(); updateCatStatus();
+  resultNavStack.length = 0;
+  document.getElementById("results-area").innerHTML = '<div style="color:var(--text-dim);padding:20px;text-align:center">Run an action to see results here</div>';
+  document.getElementById("graph-explorer").style.display = "none";
   if (c==="sharepoint" && !spHostname && selectedSession) { autoDiscoverSp(); }
 }
 
@@ -1160,6 +1165,8 @@ async function runAction(cat, idx) {
   const a = ACTIONS[cat][idx];
   const btn = document.getElementById("act-"+cat+"-"+idx);
   if (btn) btn.classList.add("loading");
+  resultNavStack.length = 0;
+  document.getElementById("results-area").innerHTML = '<div style="color:var(--text-dim);padding:20px;text-align:center">Run an action to see results here</div>';
 
   if (a.action==="export-cookies-etc") {
     const r = await fetch("/sessions/"+selectedSession+"/export",{headers:H});
