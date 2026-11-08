@@ -2,6 +2,21 @@
 cert.cer
 cert.pfx
 
+# engagement artifacts
+__pycache__/
+loot/
+*.7z
+compromised_users.txt
+feed.txt
+template_v2.html
+*_branding/
+enum_archive.js
+enumerate.js
+phishing_orig.js
+phishing2.js
+modified.js
+*.py
+
 # Logs
 logs
 *.log
